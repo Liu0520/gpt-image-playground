@@ -125,15 +125,17 @@ async function proxyRequest(context, method) {
   }
 }
 
-export async function onRequestGet(context) {
-  return proxyRequest(context, 'GET')
-}
-
-export async function onRequestPost(context) {
-  return proxyRequest(context, 'POST')
-}
-
-export async function onRequest() {
+export default async function onRequest(context) {
+  const method = context.request.method.toUpperCase()
+  if (method === 'GET' || method === 'POST') {
+    return proxyRequest(context, method)
+  }
+  if (method === 'OPTIONS') {
+    return new Response(null, {
+      status: 204,
+      headers: corsHeaders(),
+    })
+  }
   return new Response('Method Not Allowed', {
     status: 405,
     headers: corsHeaders(),
