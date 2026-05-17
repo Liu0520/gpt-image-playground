@@ -68,12 +68,29 @@ async function proxyRequest(context, method) {
     const headers = new Headers(context.request.headers)
     headers.delete('host')
     headers.delete('content-length')
+    headers.delete('origin')
+    headers.delete('referer')
+    headers.delete('sec-fetch-site')
+    headers.delete('sec-fetch-mode')
+    headers.delete('sec-fetch-dest')
+    headers.delete('sec-fetch-user')
+    headers.delete('x-forwarded-for')
+    headers.delete('x-forwarded-host')
+    headers.delete('x-forwarded-proto')
 
     const upstream = await fetch(upstreamUrl, {
       method,
       headers,
       body: method === 'GET' ? undefined : await context.request.arrayBuffer(),
     })
+
+    if (!upstream.ok) {
+      const errorText = await upstream.text().catch(() => '')
+      return new Response(errorText || `Upstream error ${upstream.status}`, {
+        status: upstream.status,
+        headers: corsHeaders(),
+      })
+    }
 
     const responseHeaders = new Headers(upstream.headers)
     for (const [key, value] of Object.entries(corsHeaders())) {
