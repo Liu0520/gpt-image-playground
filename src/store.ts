@@ -33,7 +33,7 @@ import {
 import { callImageApi } from './lib/api'
 import { IMAGE_FETCH_CORS_HINT } from './lib/imageApiShared'
 import { getFalErrorMessage, getFalQueuedImageResult } from './lib/falAiImageApi'
-import { getCustomQueuedImageResult } from './lib/openaiCompatibleImageApi'
+import { getCustomQueuedImageResult, getOpenAIResponsesImageResult, shouldUseOpenAIResponsesBackground } from './lib/openaiCompatibleImageApi'
 import { validateMaskMatchesImage } from './lib/canvasImage'
 import { orderInputImagesForMask } from './lib/mask'
 import { getChangedParams, normalizeParamsForSettings } from './lib/paramCompatibility'
@@ -53,9 +53,11 @@ const MAX_THUMBNAIL_CACHE_ENTRIES = 80
 const MAX_THUMBNAIL_BACKFILL_CONCURRENT = 4
 const FAL_RECOVERY_POLL_MS = 10_000
 const CUSTOM_RECOVERY_POLL_MS = 10_000
+const OPENAI_RESPONSES_RECOVERY_POLL_MS = 10_000
 const SUPPORT_PROMPT_IMAGE_THRESHOLD = 50
 const falRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const customRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
+const openAIResponsesRecoveryTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const openAIWatchdogTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const OPENAI_INTERRUPTED_ERROR = '请求中断'
 
@@ -673,7 +675,7 @@ function isAsyncCustomProviderTask(settings: AppSettings, provider: string, hasI
 export function markInterruptedOpenAIRunningTasks(tasks: TaskRecord[], now = Date.now()) {
   const interruptedTasks: TaskRecord[] = []
   const updatedTasks = tasks.map((task) => {
-    if (!isRunningOpenAITask(task) || task.customTaskId) return task
+    if (!isRunningOpenAITask(task) || task.customTaskId || task.openAIResponseId) return task
 
     const updated: TaskRecord = {
       ...task,
@@ -906,6 +908,21 @@ function scheduleCustomRecovery(taskId: string, delayMs = CUSTOM_RECOVERY_POLL_M
   customRecoveryTimers.set(taskId, timer)
 }
 
+function clearOpenAIResponsesRecoveryTimer(taskId: string) {
+  const timer = openAIResponsesRecoveryTimers.get(taskId)
+  if (timer) clearTimeout(timer)
+  openAIResponsesRecoveryTimers.delete(taskId)
+}
+
+function scheduleOpenAIResponsesRecovery(taskId: string, delayMs = OPENAI_RESPONSES_RECOVERY_POLL_MS) {
+  if (openAIResponsesRecoveryTimers.has(taskId)) return
+  const timer = setTimeout(() => {
+    openAIResponsesRecoveryTimers.delete(taskId)
+    recoverOpenAIResponsesTask(taskId)
+  }, delayMs)
+  openAIResponsesRecoveryTimers.set(taskId, timer)
+}
+
 function hasActualParams(params: Partial<TaskParams> | undefined): params is Partial<TaskParams> {
   return Boolean(params && Object.keys(params).length > 0)
 }
@@ -1045,6 +1062,13 @@ export async function initStore() {
       (task.status === 'running' || task.customRecoverable)
     ) {
       scheduleCustomRecovery(task.id, 0)
+    }
+    if (
+      task.apiProvider === 'openai' &&
+      task.openAIResponseId &&
+      task.status === 'running'
+    ) {
+      scheduleOpenAIResponsesRecovery(task.id, 0)
     }
   }
 
@@ -1234,8 +1258,12 @@ async function executeTask(taskId: string) {
   let customTaskInfo: { taskId: string } | null = task.customTaskId
     ? { taskId: task.customTaskId }
     : null
+  let openAIResponseInfo: { responseId: string } | null = task.openAIResponseId
+    ? { responseId: task.openAIResponseId }
+    : null
 
-  if (taskProvider !== 'fal' && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
+  const isOpenAIResponsesBackgroundTask = taskProvider === 'openai' && activeProfile.apiMode === 'responses' && shouldUseOpenAIResponsesBackground(activeProfile)
+  if (taskProvider !== 'fal' && !isOpenAIResponsesBackgroundTask && !isAsyncCustomProviderTask(requestSettings, taskProvider, task.inputImageIds.length > 0)) {
     scheduleOpenAIWatchdog(taskId, activeProfile.timeout)
   }
 
@@ -1272,6 +1300,12 @@ async function executeTask(taskId: string) {
         updateTaskInStore(taskId, {
           customTaskId: request.taskId,
           customRecoverable: false,
+        })
+      },
+      onOpenAIResponseEnqueued: (response) => {
+        openAIResponseInfo = response
+        updateTaskInStore(taskId, {
+          openAIResponseId: response.responseId,
         })
       },
     })
@@ -1323,6 +1357,7 @@ async function executeTask(taskId: string) {
     updateTaskInStore(taskId, {
       outputImages: outputIds,
       rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+      openAIResponseId: openAIResponseInfo?.responseId,
       actualParams,
       actualParamsByImage,
       revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
@@ -1688,6 +1723,39 @@ async function completeRecoveredCustomTask(task: TaskRecord, result: Awaited<Ret
   useStore.getState().showToast(`自定义异步任务已恢复，共 ${outputIds.length} 张图片`, 'success')
 }
 
+async function completeRecoveredOpenAIResponsesTask(task: TaskRecord, result: Awaited<ReturnType<typeof getOpenAIResponsesImageResult>>) {
+  const latest = useStore.getState().tasks.find((item) => item.id === task.id)
+  if (!latest || latest.status === 'done') return
+
+  const outputIds: string[] = []
+  for (const dataUrl of result.images) {
+    const imgId = await storeImage(dataUrl, 'generated')
+    cacheImage(imgId, dataUrl)
+    outputIds.push(imgId)
+  }
+
+  const actualParams = { ...result.actualParams, n: outputIds.length }
+  const actualParamsByImage = mapActualParamsByImage(outputIds, result.actualParamsList)
+  const revisedPromptByImage = result.revisedPrompts?.reduce<Record<string, string>>((acc, revisedPrompt, index) => {
+    const imgId = outputIds[index]
+    if (imgId && revisedPrompt && revisedPrompt.trim()) acc[imgId] = revisedPrompt
+    return acc
+  }, {})
+
+  updateTaskInStore(task.id, {
+    outputImages: outputIds,
+    rawImageUrls: result.rawImageUrls?.length ? result.rawImageUrls : undefined,
+    actualParams,
+    actualParamsByImage,
+    revisedPromptByImage: revisedPromptByImage && Object.keys(revisedPromptByImage).length > 0 ? revisedPromptByImage : undefined,
+    status: 'done',
+    error: null,
+    finishedAt: Date.now(),
+    elapsed: Date.now() - task.createdAt,
+  })
+  useStore.getState().showToast(`OpenAI background 任务已恢复，共 ${outputIds.length} 张图片`, 'success')
+}
+
 async function recoverCustomTask(taskId: string) {
   const { settings, tasks } = useStore.getState()
   const task = tasks.find((item) => item.id === taskId)
@@ -1711,6 +1779,33 @@ async function recoverCustomTask(taskId: string) {
       error: err instanceof Error ? err.message : String(err),
       ...getRawErrorPayload(err),
       customRecoverable: false,
+      finishedAt: Date.now(),
+      elapsed: Date.now() - task.createdAt,
+    })
+  }
+}
+
+async function recoverOpenAIResponsesTask(taskId: string) {
+  const { settings, tasks } = useStore.getState()
+  const task = tasks.find((item) => item.id === taskId)
+  if (!task || !task.openAIResponseId || task.status === 'done') return
+
+  const profile = getTaskApiProfile(settings, task)
+  if (!profile || profile.provider !== 'openai') {
+    scheduleOpenAIResponsesRecovery(taskId)
+    return
+  }
+
+  try {
+    const result = await getOpenAIResponsesImageResult(profile, task.openAIResponseId, task.params)
+    clearOpenAIResponsesRecoveryTimer(taskId)
+    await completeRecoveredOpenAIResponsesTask(task, result)
+  } catch (err) {
+    clearOpenAIResponsesRecoveryTimer(taskId)
+    updateTaskInStore(taskId, {
+      status: 'error',
+      error: err instanceof Error ? err.message : String(err),
+      ...getRawErrorPayload(err),
       finishedAt: Date.now(),
       elapsed: Date.now() - task.createdAt,
     })

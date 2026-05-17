@@ -1,6 +1,6 @@
 import type { ApiProfile, CustomProviderDefinition, CustomProviderPollMapping, CustomProviderResultMapping, CustomProviderSubmitMapping, ImageApiResponse, ResponsesApiResponse, TaskParams } from '../types'
 import { dataUrlToBlob, imageDataUrlToPngBlob, maskDataUrlToPngBlob } from './canvasImage'
-import { buildApiUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
+import { buildApiUrl, normalizeBaseUrl, readClientDevProxyConfig, shouldUseApiProxy } from './devProxy'
 import {
   assertImageInputPayloadSize,
   assertMaskEditFileSize,
@@ -19,6 +19,19 @@ import {
 } from './imageApiShared'
 
 const PROMPT_REWRITE_GUARD_PREFIX = 'Use the following text as the complete prompt. Do not rewrite it:'
+
+export function shouldUseOpenAIResponsesBackground(profile: ApiProfile): boolean {
+  const proxyConfig = readClientDevProxyConfig()
+  const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
+  const effectiveBaseUrl = useApiProxy && proxyConfig?.target ? proxyConfig.target : profile.baseUrl
+
+  try {
+    const url = new URL(normalizeBaseUrl(effectiveBaseUrl))
+    return url.hostname === 'api.openai.com'
+  } catch {
+    return false
+  }
+}
 
 function appendQuery(path: string, query?: Record<string, string>): string {
   if (!query || !Object.keys(query).length) return path
@@ -164,6 +177,34 @@ function parseResponsesImageResults(payload: ResponsesApiResponse, fallbackMime:
   }
 
   return results
+}
+
+function getResponsesStatus(payload: ResponsesApiResponse): string {
+  return typeof payload.status === 'string' ? payload.status : ''
+}
+
+function getResponsesFailureMessage(payload: ResponsesApiResponse): string {
+  const error = payload.error
+  if (typeof error === 'string' && error.trim()) return error
+  if (error && typeof error === 'object' && typeof error.message === 'string' && error.message.trim()) {
+    return error.message
+  }
+  if (payload.incomplete_details?.reason) return payload.incomplete_details.reason
+  const status = getResponsesStatus(payload)
+  return status ? `Responses 任务状态为 ${status}` : 'Responses 任务失败'
+}
+
+function assertResponsesNotFailed(payload: ResponsesApiResponse) {
+  const status = getResponsesStatus(payload)
+  if (status === 'failed' || status === 'cancelled' || status === 'incomplete' || status === 'expired') {
+    throw new Error(getResponsesFailureMessage(payload))
+  }
+}
+
+function isResponsesImageCompleted(payload: ResponsesApiResponse): boolean {
+  const status = getResponsesStatus(payload)
+  if (status === 'completed') return true
+  return !status && Array.isArray(payload.output)
 }
 
 async function parseImagesApiResponse(payload: ImageApiResponse, mime: string, signal?: AbortSignal): Promise<CallApiResult> {
@@ -641,6 +682,71 @@ async function pollCustomTaskResult(
   }
 }
 
+async function pollOpenAIResponsesImageResult(
+  profile: ApiProfile,
+  responseId: string,
+  mime: string,
+): Promise<CallApiResult> {
+  const proxyConfig = readClientDevProxyConfig()
+  const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
+  const requestHeaders = createRequestHeaders(profile)
+  const pollController = new AbortController()
+
+  while (true) {
+    await sleep(5_000, pollController.signal)
+
+    let payload: ResponsesApiResponse
+    try {
+      const response = await fetch(buildApiUrl(profile.baseUrl, `responses/${encodeURIComponent(responseId)}`, proxyConfig, useApiProxy), {
+        method: 'GET',
+        headers: requestHeaders,
+        cache: 'no-store',
+        signal: pollController.signal,
+      })
+
+      if (!response.ok) {
+        if (isRetryablePollingStatus(response.status)) continue
+        throw new Error(await getApiErrorMessage(response))
+      }
+
+      payload = await response.json() as ResponsesApiResponse
+    } catch (err) {
+      if (!pollController.signal.aborted && isRecoverablePollingError(err)) continue
+      throw err
+    }
+
+    assertResponsesNotFailed(payload)
+    if (!isResponsesImageCompleted(payload)) continue
+
+    try {
+      const imageResults = parseResponsesImageResults(payload, mime)
+      const actualParams = mergeActualParams(
+        imageResults[0]?.actualParams ?? {},
+      )
+      return {
+        images: imageResults.map((result) => result.image),
+        actualParams,
+        actualParamsList: imageResults.map((result) =>
+          mergeActualParams(result.actualParams ?? {}),
+        ),
+        revisedPrompts: imageResults.map((result) => result.revisedPrompt),
+      }
+    } catch (err) {
+      if (!pollController.signal.aborted && isRecoverablePollingError(err)) continue
+      throw err
+    }
+  }
+}
+
+export async function getOpenAIResponsesImageResult(
+  profile: ApiProfile,
+  responseId: string,
+  params: TaskParams,
+): Promise<CallApiResult> {
+  const mime = MIME_MAP[params.output_format] || 'image/png'
+  return pollOpenAIResponsesImageResult(profile, responseId, mime)
+}
+
 export async function getCustomQueuedImageResult(
   profile: ApiProfile,
   customProvider: CustomProviderDefinition,
@@ -723,8 +829,8 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
   const proxyConfig = readClientDevProxyConfig()
   const useApiProxy = shouldUseApiProxy(profile.apiProxy, proxyConfig)
   const requestHeaders = createRequestHeaders(profile)
-  const controller = new AbortController()
-  const timeoutId = setTimeout(() => controller.abort(), profile.timeout * 1000)
+  const submitController = new AbortController()
+  let timeoutId: ReturnType<typeof setTimeout> | null = setTimeout(() => submitController.abort(), profile.timeout * 1000)
 
   try {
     if (opts.maskDataUrl) {
@@ -736,11 +842,17 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
         (opts.maskDataUrl ? getDataUrlEncodedByteSize(opts.maskDataUrl) : 0),
     )
 
-    const body = {
+    const useBackground = shouldUseOpenAIResponsesBackground(profile)
+    const body: Record<string, unknown> = {
       model: profile.model,
       input: createResponsesInput(prompt, inputImageDataUrls),
       tools: [createResponsesImageTool(params, inputImageDataUrls.length > 0, profile, opts.maskDataUrl)],
-      tool_choice: 'required',
+      tool_choice: { type: 'image_generation' },
+    }
+
+    if (useBackground) {
+      body.background = true
+      body.store = true
     }
 
     const response = await fetch(buildApiUrl(profile.baseUrl, 'responses', proxyConfig, useApiProxy), {
@@ -751,7 +863,7 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       },
       cache: 'no-store',
       body: JSON.stringify(body),
-      signal: controller.signal,
+      signal: submitController.signal,
     })
 
     if (!response.ok) {
@@ -759,6 +871,22 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
     }
 
     const payload = await response.json() as ResponsesApiResponse
+    if (timeoutId) {
+      clearTimeout(timeoutId)
+      timeoutId = null
+    }
+    assertResponsesNotFailed(payload)
+    if (useBackground && !isResponsesImageCompleted(payload)) {
+      const responseId = typeof payload.id === 'string' ? payload.id.trim() : ''
+      if (!responseId) {
+        const err = new Error('Responses background 任务没有返回 response id')
+        ;(err as any).rawResponsePayload = JSON.stringify(payload, null, 2)
+        throw err
+      }
+      opts.onOpenAIResponseEnqueued?.({ responseId })
+      return pollOpenAIResponsesImageResult(profile, responseId, mime)
+    }
+
     const imageResults = parseResponsesImageResults(payload, mime)
     const actualParams = mergeActualParams(
       imageResults[0]?.actualParams ?? {},
@@ -772,6 +900,6 @@ async function callResponsesImageApiSingle(opts: CallApiOptions, profile: ApiPro
       revisedPrompts: imageResults.map((result) => result.revisedPrompt),
     }
   } finally {
-    clearTimeout(timeoutId)
+    if (timeoutId) clearTimeout(timeoutId)
   }
 }

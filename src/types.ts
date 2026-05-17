@@ -148,6 +148,8 @@ export interface TaskRecord {
   customTaskId?: string
   /** 自定义异步任务是否等待自动恢复 */
   customRecoverable?: boolean
+  /** OpenAI Responses background 任务 ID，用于长耗时图片任务轮询 */
+  openAIResponseId?: string
   /** API 返回的实际生效参数，用于标记与请求值不一致的情况 */
   actualParams?: Partial<TaskParams>
   /** 输出图片对应的实际生效参数，key 为 outputImages 中的图片 id */
@@ -253,7 +255,16 @@ export interface ResponsesOutputItem {
 }
 
 export interface ResponsesApiResponse {
+  id?: string
+  status?: string
   output?: ResponsesOutputItem[]
+  error?: {
+    message?: string
+    code?: string
+  } | string | null
+  incomplete_details?: {
+    reason?: string
+  } | null
   tools?: Array<{
     type?: string
     size?: string

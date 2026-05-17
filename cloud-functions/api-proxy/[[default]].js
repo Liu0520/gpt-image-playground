@@ -1,13 +1,7 @@
-const ALLOWED_PATHS = new Set([
-  'responses',
-  'images/generations',
-  'images/edits',
-])
-
 function corsHeaders() {
   return {
     'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
     'Access-Control-Allow-Headers': 'authorization, content-type',
   }
 }
@@ -21,9 +15,12 @@ function buildUpstreamUrl(request, targetBase) {
   const rawPath = url.pathname.replace(/^\/api-proxy\/?/, '').replace(/^\/+/, '')
   const upstreamPath = rawPath.replace(/^v1\//, '')
 
-  if (!ALLOWED_PATHS.has(upstreamPath)) {
-    return null
-  }
+  if (
+    upstreamPath !== 'responses' &&
+    upstreamPath !== 'images/generations' &&
+    upstreamPath !== 'images/edits' &&
+    !/^responses\/[A-Za-z0-9_.-]+$/.test(upstreamPath)
+  ) return null
 
   return `${targetBase.replace(/\/+$/, '')}/${upstreamPath}${url.search}`
 }
@@ -35,7 +32,7 @@ export async function onRequestOptions() {
   })
 }
 
-export async function onRequestPost(context) {
+async function proxyRequest(context, method) {
   const targetBase = getEnv(context, 'API_PROXY_URL')
 
   if (!targetBase) {
@@ -58,9 +55,9 @@ export async function onRequestPost(context) {
   headers.delete('content-length')
 
   const upstream = await fetch(upstreamUrl, {
-    method: 'POST',
+    method,
     headers,
-    body: context.request.body,
+    body: method === 'GET' ? undefined : context.request.body,
   })
 
   const responseHeaders = new Headers(upstream.headers)
@@ -72,6 +69,14 @@ export async function onRequestPost(context) {
     status: upstream.status,
     headers: responseHeaders,
   })
+}
+
+export async function onRequestGet(context) {
+  return proxyRequest(context, 'GET')
+}
+
+export async function onRequestPost(context) {
+  return proxyRequest(context, 'POST')
 }
 
 export async function onRequest() {

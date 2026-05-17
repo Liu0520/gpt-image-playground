@@ -36,6 +36,92 @@ describe('callImageApi', () => {
     },
   )
 
+  it('uses Responses API background mode and polls the response result', async () => {
+    vi.useFakeTimers()
+    const onOpenAIResponseEnqueued = vi.fn()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_123',
+        status: 'queued',
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        id: 'resp_123',
+        status: 'completed',
+        output: [{
+          type: 'image_generation_call',
+          result: 'aW1hZ2U=',
+        }],
+      }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }))
+
+    const promise = callImageApi({
+      settings: { ...DEFAULT_SETTINGS, apiKey: 'test-key', apiMode: 'responses' },
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS },
+      inputImageDataUrls: [],
+      onOpenAIResponseEnqueued,
+    })
+
+    await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1))
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.background).toBe(true)
+    expect(body.store).toBe(true)
+    expect(body.tool_choice).toEqual({ type: 'image_generation' })
+    await vi.waitFor(() => expect(onOpenAIResponseEnqueued).toHaveBeenCalledWith({ responseId: 'resp_123' }))
+
+    await vi.advanceTimersByTimeAsync(5000)
+
+    await expect(promise).resolves.toEqual({
+      images: ['data:image/png;base64,aW1hZ2U='],
+      actualParams: undefined,
+      actualParamsList: [undefined],
+      revisedPrompts: [undefined],
+    })
+    expect(fetchMock.mock.calls[1][0]).toBe('https://api.openai.com/v1/responses/resp_123')
+  })
+
+  it('does not enable Responses background mode for non-OpenAI compatible endpoints', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
+      output: [{
+        type: 'image_generation_call',
+        result: 'aW1hZ2U=',
+      }],
+    }), {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+
+    await callImageApi({
+      settings: {
+        ...DEFAULT_SETTINGS,
+        apiKey: 'test-key',
+        apiMode: 'responses',
+        baseUrl: 'https://sub2api.jianhu.cc/v1',
+        profiles: [{
+          ...DEFAULT_SETTINGS.profiles[0],
+          apiKey: 'test-key',
+          apiMode: 'responses',
+          baseUrl: 'https://sub2api.jianhu.cc/v1',
+          apiProxy: false,
+        }],
+      },
+      prompt: 'prompt',
+      params: { ...DEFAULT_PARAMS },
+      inputImageDataUrls: [],
+    })
+
+    const [, init] = fetchMock.mock.calls[0]
+    const body = JSON.parse(String((init as RequestInit).body))
+    expect(body.background).toBeUndefined()
+    expect(body.store).toBeUndefined()
+  })
+
   it('records actual params returned on Images API responses in Codex CLI mode', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       output_format: 'png',
@@ -176,7 +262,7 @@ describe('callImageApi', () => {
     expect((init as RequestInit).cache).toBe('no-store')
   })
 
-  it('ignores stored API proxy settings when the current deployment has no proxy', async () => {
+  it('uses the direct API URL when API proxy is disabled for the profile', async () => {
     vi.stubEnv('VITE_API_PROXY_AVAILABLE', 'false')
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(new Response(JSON.stringify({
       data: [{ b64_json: 'aW1hZ2U=' }],
@@ -189,7 +275,7 @@ describe('callImageApi', () => {
       settings: {
         ...DEFAULT_SETTINGS,
         apiKey: 'test-key',
-        apiProxy: true,
+        apiProxy: false,
         baseUrl: 'http://api.example.com/v1',
       },
       prompt: 'prompt',
