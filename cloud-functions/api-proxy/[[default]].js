@@ -7,7 +7,8 @@ function corsHeaders() {
 }
 
 function getEnv(context, name) {
-  return context?.env?.[name] || process?.env?.[name] || ''
+  const nodeEnv = typeof process !== 'undefined' ? process.env?.[name] : ''
+  return context?.env?.[name] || nodeEnv || ''
 }
 
 function buildUpstreamUrl(request, targetBase) {
@@ -33,42 +34,50 @@ export async function onRequestOptions() {
 }
 
 async function proxyRequest(context, method) {
-  const targetBase = getEnv(context, 'API_PROXY_URL')
+  try {
+    const targetBase = getEnv(context, 'API_PROXY_URL')
 
-  if (!targetBase) {
-    return new Response('Missing API_PROXY_URL', {
-      status: 500,
+    if (!targetBase) {
+      return new Response('Missing API_PROXY_URL', {
+        status: 500,
+        headers: corsHeaders(),
+      })
+    }
+
+    const upstreamUrl = buildUpstreamUrl(context.request, targetBase)
+    if (!upstreamUrl) {
+      return new Response('Forbidden: API Proxy path restricted', {
+        status: 403,
+        headers: corsHeaders(),
+      })
+    }
+
+    const headers = new Headers(context.request.headers)
+    headers.delete('host')
+    headers.delete('content-length')
+
+    const upstream = await fetch(upstreamUrl, {
+      method,
+      headers,
+      body: method === 'GET' ? undefined : await context.request.arrayBuffer(),
+    })
+
+    const responseHeaders = new Headers(upstream.headers)
+    for (const [key, value] of Object.entries(corsHeaders())) {
+      responseHeaders.set(key, value)
+    }
+
+    return new Response(upstream.body, {
+      status: upstream.status,
+      headers: responseHeaders,
+    })
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    return new Response(`Proxy error: ${message}`, {
+      status: 502,
       headers: corsHeaders(),
     })
   }
-
-  const upstreamUrl = buildUpstreamUrl(context.request, targetBase)
-  if (!upstreamUrl) {
-    return new Response('Forbidden: API Proxy path restricted', {
-      status: 403,
-      headers: corsHeaders(),
-    })
-  }
-
-  const headers = new Headers(context.request.headers)
-  headers.delete('host')
-  headers.delete('content-length')
-
-  const upstream = await fetch(upstreamUrl, {
-    method,
-    headers,
-    body: method === 'GET' ? undefined : context.request.body,
-  })
-
-  const responseHeaders = new Headers(upstream.headers)
-  for (const [key, value] of Object.entries(corsHeaders())) {
-    responseHeaders.set(key, value)
-  }
-
-  return new Response(upstream.body, {
-    status: upstream.status,
-    headers: responseHeaders,
-  })
 }
 
 export async function onRequestGet(context) {
