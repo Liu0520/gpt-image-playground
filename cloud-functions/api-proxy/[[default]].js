@@ -38,6 +38,13 @@ async function proxyRequest(context, method) {
     const targetBase = getEnv(context, 'API_PROXY_URL')
     const requestUrl = new URL(context.request.url)
     const route = requestUrl.pathname.replace(/^\/api-proxy\/?/, '').replace(/^\/+/, '')
+    console.log('[api-proxy] request', {
+      method,
+      route,
+      requestId: context.request?.requestId,
+      hasApiProxyUrl: Boolean(targetBase),
+      targetBaseHost: targetBase ? new URL(targetBase).host : '',
+    })
 
     if (method === 'GET' && (route === 'health' || route === 'ping')) {
       return Response.json({
@@ -83,9 +90,17 @@ async function proxyRequest(context, method) {
       headers,
       body: method === 'GET' ? undefined : await context.request.arrayBuffer(),
     })
+    console.log('[api-proxy] upstream', {
+      method,
+      route,
+      status: upstream.status,
+      ok: upstream.ok,
+      upstreamUrl,
+    })
 
     if (!upstream.ok) {
       const errorText = await upstream.text().catch(() => '')
+      console.log('[api-proxy] upstream error body', errorText.slice(0, 500))
       return new Response(errorText || `Upstream error ${upstream.status}`, {
         status: upstream.status,
         headers: corsHeaders(),
