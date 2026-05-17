@@ -36,6 +36,19 @@ export async function onRequestOptions() {
 async function proxyRequest(context, method) {
   try {
     const targetBase = getEnv(context, 'API_PROXY_URL')
+    const requestUrl = new URL(context.request.url)
+    const route = requestUrl.pathname.replace(/^\/api-proxy\/?/, '').replace(/^\/+/, '')
+
+    if (method === 'GET' && (route === 'health' || route === 'ping')) {
+      return Response.json({
+        ok: true,
+        route,
+        hasApiProxyUrl: Boolean(targetBase),
+        targetBase: targetBase ? targetBase.replace(/\/+$/, '') : '',
+      }, {
+        headers: corsHeaders(),
+      })
+    }
 
     if (!targetBase) {
       return new Response('Missing API_PROXY_URL', {
